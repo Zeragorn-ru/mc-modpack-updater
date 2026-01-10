@@ -91,6 +91,7 @@ fun main() {
             println("removes.txt changed, downloading…")
             val removesPath = minecraftDir.resolve("removes.txt")
 
+            Files.deleteIfExists(removesPath)
             downloadFile(client, removesAsset["browser_download_url"].asText(), removesPath)
 
             Files.readAllLines(removesPath).forEach { line ->
@@ -124,6 +125,7 @@ fun main() {
             println("Archive changed, downloading and unpacking…")
             val tempZip = baseDir.resolve("temp.zip")
 
+            Files.deleteIfExists(tempZip)
             downloadFile(client, archiveAsset["browser_download_url"].asText(), tempZip)
             unzip(tempZip, baseDir)
 
