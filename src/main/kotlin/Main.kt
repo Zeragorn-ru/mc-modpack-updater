@@ -1,10 +1,9 @@
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.InputStream
-import java.nio.file.Files
-import java.nio.file.Path
-import java.nio.file.Paths
-import java.security.MessageDigest
+import java.nio.file.*
+import java.net.URI
+import java.util.Comparator
 import java.util.zip.ZipInputStream
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.JsonNode
@@ -23,6 +22,19 @@ fun main() {
 
     val baseDir = Paths.get("..").toAbsolutePath().normalize()
     println("Base directory: $baseDir")
+
+    // === Самоопределение пути к текущему updater'у (для самообновления) ===
+    val currentUpdater = try {
+        val location = MainKt::class.java.protectionDomain.codeSource.location
+        if (location != null) {
+            Paths.get(URI(location.toString())).normalize()
+        } else null
+    } catch (e: Exception) {
+        println("Не удалось определить путь к updater'у (не JAR?)")
+        null
+    }
+
+    val updaterFileName = currentUpdater?.fileName?.toString() ?: ""
 
     val minecraftDir = baseDir.resolve("minecraft")
     if (!Files.exists(minecraftDir)) {
@@ -44,7 +56,7 @@ fun main() {
     println("Loaded config: $config")
 
     val client = OkHttpClient()
-    val apiUrl = "https://api.github.com/repos/Zeragorn-ru/dustpack/releases/latest"
+    val apiUrl = "https://api.github.com/repos/Zeragorn-ru/glorp-2-modpack/releases/latest"
 
     println("Fetching latest release info from GitHub…")
 
@@ -87,28 +99,40 @@ fun main() {
         val digest = removesAsset["digest"].asText()
         println("Found removes.txt with digest $digest")
 
-        if (digest != config.removesDigest) {
-            println("removes.txt changed, downloading…")
-            val removesPath = minecraftDir.resolve("removes.txt")
+        println("removes.txt downloading…")
+        val removesPath = minecraftDir.resolve("removes.txt")
 
-            Files.deleteIfExists(removesPath)
-            downloadFile(client, removesAsset["browser_download_url"].asText(), removesPath)
+        Files.deleteIfExists(removesPath)
+        downloadFile(client, removesAsset["browser_download_url"].asText(), removesPath)
 
-            Files.readAllLines(removesPath).forEach { line ->
-                if (line.isNotBlank()) {
-                    val target = minecraftDir.resolve(line)
-                    if (Files.exists(target)) {
+        Files.readAllLines(removesPath).forEach { line ->
+            if (line.isNotBlank()) {
+                val target = minecraftDir.resolve(line.trim())
+                if (Files.exists(target)) {
+
+                    // Пропускаем самоудаление сейчас — сделаем после выхода программы
+                    if (currentUpdater != null && target == currentUpdater) {
+                        println("Skipping self-delete for now (will be done after exit)")
+                    } else {
                         println("Removing: $target")
-                        Files.delete(target)
+                        try {
+                            if (Files.isDirectory(target)) {
+                                Files.walk(target)
+                                    .sorted(Comparator.reverseOrder())
+                                    .forEach { Files.delete(it) }
+                            } else {
+                                Files.delete(target)
+                            }
+                        } catch (e: Exception) {
+                            System.err.println("Не удалось удалить $target → ${e.message}")
+                        }
                     }
                 }
             }
-
-            Files.deleteIfExists(removesPath)
-            config.removesDigest = digest
-        } else {
-            println("removes.txt unchanged, skipping")
         }
+
+        Files.deleteIfExists(removesPath)
+        config.removesDigest = digest
     } else {
         println("No removes.txt found in release")
     }
@@ -127,7 +151,7 @@ fun main() {
 
             Files.deleteIfExists(tempZip)
             downloadFile(client, archiveAsset["browser_download_url"].asText(), tempZip)
-            unzip(tempZip, baseDir)
+            unzip(tempZip, baseDir, currentUpdater)   // ← передаём для самообновления
 
             Files.deleteIfExists(tempZip)
             config.archiveDigest = digest
@@ -136,6 +160,25 @@ fun main() {
         }
     } else {
         println("No archive found in release")
+    }
+
+    // === Подготовка самообновления (удалит старую версию и поставит новую после выхода) ===
+    if (currentUpdater != null) {
+        Runtime.getRuntime().addShutdownHook(object : Thread() {
+            override fun run() {
+                val newUpdater = currentUpdater.resolveSibling(updaterFileName + ".new")
+                if (Files.exists(newUpdater)) {
+                    try {
+                        Files.deleteIfExists(currentUpdater)
+                        Files.move(newUpdater, currentUpdater)
+                        println("=== Updater successfully self-updated! ===")
+                    } catch (e: Exception) {
+                        System.err.println("Self-update failed: ${e.message}")
+                    }
+                }
+            }
+        })
+        println("Self-update prepared — will apply after program exit")
     }
 
     saveConfig(configFile, mapper, config)
@@ -159,21 +202,29 @@ fun downloadFile(client: OkHttpClient, url: String, target: Path) {
     }
 }
 
-fun unzip(zipPath: Path, targetDir: Path) {
+fun unzip(zipPath: Path, targetDir: Path, currentUpdater: Path?) {
     println("Unpacking archive: $zipPath to $targetDir")
     ZipInputStream(Files.newInputStream(zipPath)).use { zip ->
         var entry = zip.nextEntry
         while (entry != null) {
             val outPath = targetDir.resolve(entry.name)
-            if (entry.isDirectory) {
-                Files.createDirectories(outPath)
+
+            // Если в архиве лежит новая версия самого updater'а — распаковываем как .new
+            val finalPath = if (currentUpdater != null && entry.name == currentUpdater.fileName.toString()) {
+                currentUpdater.resolveSibling(currentUpdater.fileName.toString() + ".new")
             } else {
-                Files.createDirectories(outPath.parent)
-                if (Files.exists(outPath)) {
-                    println("Skipping existing file: $outPath")
+                outPath
+            }
+
+            if (entry.isDirectory) {
+                Files.createDirectories(finalPath)
+            } else {
+                Files.createDirectories(finalPath.parent)
+                if (Files.exists(finalPath)) {
+                    println("Skipping existing file: $finalPath")
                 } else {
-                    Files.copy(zip as InputStream, outPath)
-                    println("Created file: $outPath")
+                    Files.copy(zip as InputStream, finalPath)
+                    println("Created file: $finalPath")
                 }
             }
             zip.closeEntry()
